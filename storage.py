@@ -4,7 +4,7 @@ import time
 from fnmatch import fnmatchcase
 
 
-def _now_ms():
+def now_ms():
     """Current Unix time in milliseconds (wall clock, survives restarts)."""
     return int(time.time() * 1000)
 
@@ -23,7 +23,7 @@ class Storage:
         Returns True if the key was expired (and is now gone).
         """
         expire_at = self._expires.get(key)
-        if expire_at is not None and _now_ms() > expire_at:
+        if expire_at is not None and now_ms() > expire_at:
             del self._data[key]
             del self._expires[key]
             return True
@@ -98,7 +98,7 @@ class Storage:
         expire_at = self._expires.get(key)
         if expire_at is None:
             return -1
-        return expire_at - _now_ms()
+        return expire_at - now_ms()
 
     def persist(self, key):
         """Remove the key's expiry. True if an expiry was removed, else False."""

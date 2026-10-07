@@ -3,7 +3,7 @@
 import re
 
 import resp
-from storage import _now_ms  # same clock as storage's expiry checks
+from storage import now_ms  # same clock as storage's expiry checks
 
 INT64_MAX = 2**63 - 1
 
@@ -38,6 +38,11 @@ class CommandHandler:
             "DEL": self._del,
             "EXISTS": self._exists,
             "KEYS": self._keys,
+            "EXPIRE": self._expire,
+            "PEXPIRE": self._pexpire,
+            "TTL": self._ttl,
+            "PTTL": self._pttl,
+            "PERSIST": self._persist,
         }
 
     def execute(self, args):
@@ -93,7 +98,7 @@ class CommandHandler:
             if number <= 0:
                 return resp.error("ERR invalid expire time in 'set' command")
             duration_ms = number * 1000 if unit == "EX" else number
-            expire_at_ms = _now_ms() + duration_ms
+            expire_at_ms = now_ms() + duration_ms
             if expire_at_ms > INT64_MAX:  # Redis also rejects overflow
                 return resp.error("ERR invalid expire time in 'set' command")
 
@@ -120,3 +125,52 @@ class CommandHandler:
         if len(args) != 1:
             return _wrong_args("keys")
         return resp.array(self.storage.keys(args[0]))
+
+    # ---------- Expiry commands ----------
+
+    def _generic_expire(self, args, name, unit_ms):
+        """Shared logic for EXPIRE (unit_ms=1000) and PEXPIRE (unit_ms=1)."""
+        if len(args) != 2:
+            return _wrong_args(name)  # NX/XX/GT/LT options not supported
+        key = args[0]
+        number = _parse_int(args[1])
+        if number is None:
+            return resp.error("ERR value is not an integer or out of range")
+
+        expire_at_ms = now_ms() + number * unit_ms  # relative -> ABSOLUTE
+        if not -INT64_MAX - 1 <= expire_at_ms <= INT64_MAX:
+            return resp.error(f"ERR invalid expire time in '{name}' command")
+
+        if self.storage.exists(key) == 0:
+            return resp.integer(0)
+        if number <= 0:
+            # Time already passed: delete now instead of keeping a dead key
+            # in memory until someone touches it (same as real Redis).
+            self.storage.delete(key)
+            return resp.integer(1)
+        # int(): storage returns True/False, but RESP needs :1 / :0
+        return resp.integer(int(self.storage.set_expiry(key, expire_at_ms)))
+
+    def _expire(self, args):
+        return self._generic_expire(args, "expire", 1000)
+
+    def _pexpire(self, args):
+        return self._generic_expire(args, "pexpire", 1)
+
+    def _ttl(self, args):
+        if len(args) != 1:
+            return _wrong_args("ttl")
+        ms = self.storage.ttl_ms(args[0])
+        if ms < 0:
+            return resp.integer(ms)  # -1 no expiry, -2 missing key
+        return resp.integer((ms + 500) // 1000)  # round to nearest second, like Redis
+
+    def _pttl(self, args):
+        if len(args) != 1:
+            return _wrong_args("pttl")
+        return resp.integer(self.storage.ttl_ms(args[0]))
+
+    def _persist(self, args):
+        if len(args) != 1:
+            return _wrong_args("persist")
+        return resp.integer(int(self.storage.persist(args[0])))
