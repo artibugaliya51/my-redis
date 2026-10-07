@@ -2,7 +2,15 @@
 
 import random
 import time
+from collections import deque
 from fnmatch import fnmatchcase
+
+# Python type of a stored value -> Redis type name
+_TYPE_NAMES = {str: "string", deque: "list", dict: "hash", set: "set"}
+
+
+class WrongTypeError(Exception):
+    """A command was used on a key holding the wrong kind of value."""
 
 
 def now_ms():
@@ -45,6 +53,41 @@ class Storage:
         """Return the value for key, or None if it does not exist."""
         self._expire_if_needed(key)
         return self._data.get(key)
+
+    def type_of(self, key):
+        """Redis type name of key: string / list / hash / set, or none."""
+        self._expire_if_needed(key)
+        if key not in self._data:
+            return "none"
+        return _TYPE_NAMES[type(self._data[key])]
+
+    def get_typed(self, key, expected_type):
+        """Return the value if it has expected_type, None if key is missing.
+
+        Raises WrongTypeError if the key holds a different type.
+        Returns the real object (not a copy), so commands can modify it in place.
+        """
+        self._expire_if_needed(key)
+        if key not in self._data:
+            return None
+        value = self._data[key]
+        if type(value) is not expected_type:
+            raise WrongTypeError(key)
+        return value
+
+    def delete_if_empty(self, key):
+        """Delete key (and its expiry) if it holds an EMPTY collection.
+
+        Redis never keeps empty lists/hashes/sets. Call this after removing items.
+        An empty string is a valid value, so it is never deleted here.
+        Returns True if the key was deleted.
+        """
+        value = self._data.get(key)
+        if isinstance(value, (deque, dict, set)) and len(value) == 0:
+            del self._data[key]
+            self._expires.pop(key, None)
+            return True
+        return False
 
     def delete(self, *keys):
         """Delete the given keys. Return how many actually existed."""

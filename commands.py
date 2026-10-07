@@ -3,9 +3,11 @@
 import re
 
 import resp
-from storage import now_ms  # same clock as storage's expiry checks
+from storage import WrongTypeError, now_ms  # same clock as storage's expiry checks
 
 INT64_MAX = 2**63 - 1
+
+WRONGTYPE_MSG = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
 # Strict integer like Redis: optional '-', no spaces, '+', '_' or leading zeros.
 _INT_RE = re.compile(r"-?(0|[1-9][0-9]*)")
@@ -43,6 +45,7 @@ class CommandHandler:
             "TTL": self._ttl,
             "PTTL": self._pttl,
             "PERSIST": self._persist,
+            "TYPE": self._type,
         }
 
     def execute(self, args):
@@ -54,7 +57,11 @@ class CommandHandler:
         handler = self.commands.get(name)
         if handler is None:
             return resp.error(f"ERR unknown command '{args[0]}'")
-        return handler(args[1:])  # pass only the arguments, not the name
+        try:
+            return handler(args[1:])  # pass only the arguments, not the name
+        except WrongTypeError:
+            # One central place for every command's type errors
+            return resp.error(WRONGTYPE_MSG)
 
     # ---------- Handlers (args = arguments without the command name) ----------
 
@@ -109,7 +116,8 @@ class CommandHandler:
     def _get(self, args):
         if len(args) != 1:
             return _wrong_args("get")
-        return resp.bulk_string(self.storage.get(args[0]))
+        # get_typed raises WrongTypeError for lists/hashes/sets
+        return resp.bulk_string(self.storage.get_typed(args[0], str))
 
     def _del(self, args):
         if not args:
@@ -174,3 +182,8 @@ class CommandHandler:
         if len(args) != 1:
             return _wrong_args("persist")
         return resp.integer(int(self.storage.persist(args[0])))
+
+    def _type(self, args):
+        if len(args) != 1:
+            return _wrong_args("type")
+        return resp.simple_string(self.storage.type_of(args[0]))
