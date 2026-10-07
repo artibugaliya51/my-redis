@@ -82,8 +82,12 @@ def simple_string(text):
 
 
 def error(message):
-    """-ERR message\\r\\n"""
-    return b"-ERR " + message.encode("utf-8") + CRLF
+    """-<message>\\r\\n
+
+    The caller passes the full message including its prefix,
+    e.g. error("ERR unknown command 'foo'") or error("WRONGTYPE ...").
+    """
+    return b"-" + message.encode("utf-8") + CRLF
 
 
 def integer(n):
