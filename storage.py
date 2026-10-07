@@ -1,5 +1,6 @@
 """In-memory key-value storage for My Redis."""
 
+import random
 import time
 from fnmatch import fnmatchcase
 
@@ -107,3 +108,20 @@ class Storage:
             del self._expires[key]
             return True
         return False
+
+    def active_expire_cycle(self, sample_size=20):
+        """Active expiration: check a RANDOM SAMPLE of keys that have a TTL.
+
+        Cleans up expired keys nobody touches (lazy expiry alone would leak them).
+        Returns (sampled, expired) so the caller can decide whether to repeat.
+        """
+        if not self._expires:
+            return 0, 0
+        # random.sample needs a sequence, so list() copies ALL TTL keys: O(n).
+        # Real Redis picks from its hash table buckets directly, without a copy.
+        sample = random.sample(list(self._expires), min(sample_size, len(self._expires)))
+        expired = 0
+        for key in sample:
+            if self._expire_if_needed(key):  # deletes from both dicts
+                expired += 1
+        return len(sample), expired

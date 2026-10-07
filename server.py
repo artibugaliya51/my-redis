@@ -1,6 +1,7 @@
 """My Redis server: asyncio TCP server speaking RESP2 on 127.0.0.1:6380."""
 
 import asyncio
+import time
 import traceback
 
 import resp
@@ -14,6 +15,11 @@ PORT = 6380
 # asyncio runs everything on a single thread (same idea as real Redis).
 storage = Storage()
 handler = CommandHandler(storage)
+
+# Active expiry settings (same numbers as real Redis defaults)
+EXPIRE_INTERVAL = 0.1        # run every 100 ms (Redis "hz 10")
+EXPIRE_TIME_LIMIT_MS = 25    # max time per run, so clients are never blocked long
+EXPIRE_REPEAT_RATIO = 0.25   # repeat immediately if > 25% of the sample was expired
 
 
 async def handle_client(reader, writer):
@@ -59,8 +65,30 @@ async def handle_client(reader, writer):
             pass
 
 
+async def active_expiry_loop():
+    """Background task: delete expired keys that no client ever touches."""
+    while True:
+        # sleep() gives control back to the event loop, so clients keep being served
+        await asyncio.sleep(EXPIRE_INTERVAL)
+        try:
+            # monotonic() (not time()) because we measure a DURATION: it never
+            # jumps if the wall clock is changed.
+            start = time.monotonic()
+            while True:
+                sampled, expired = storage.active_expire_cycle()
+                if sampled == 0 or expired <= sampled * EXPIRE_REPEAT_RATIO:
+                    break  # few expired keys left: wait for the next tick
+                if (time.monotonic() - start) * 1000 >= EXPIRE_TIME_LIMIT_MS:
+                    break  # time budget used up: continue next tick
+        except Exception:
+            traceback.print_exc()  # a bug here must not silently kill the task
+
+
 async def main():
     server = await asyncio.start_server(handle_client, HOST, PORT)
+    # Keep a reference: asyncio holds tasks only weakly, so an unreferenced
+    # task could be garbage-collected while still running.
+    expiry_task = asyncio.create_task(active_expiry_loop())
     print(f"My Redis listening on {HOST}:{PORT} (Ctrl+C to stop)")
     async with server:
         await server.serve_forever()
