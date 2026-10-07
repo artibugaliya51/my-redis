@@ -1,6 +1,8 @@
 """Command execution: turns a parsed command into a RESP reply."""
 
 import re
+from collections import deque
+from itertools import islice
 
 import resp
 from storage import WrongTypeError, now_ms  # same clock as storage's expiry checks
@@ -54,6 +56,12 @@ class CommandHandler:
             "STRLEN": self._strlen,
             "MSET": self._mset,
             "MGET": self._mget,
+            "LPUSH": self._lpush,
+            "RPUSH": self._rpush,
+            "LPOP": self._lpop,
+            "RPOP": self._rpop,
+            "LLEN": self._llen,
+            "LRANGE": self._lrange,
         }
 
     def execute(self, args):
@@ -275,3 +283,78 @@ class CommandHandler:
             except WrongTypeError:
                 values.append(None)  # MGET never errors: non-strings are nil
         return resp.array(values)
+
+    # ---------- List commands (value = collections.deque) ----------
+
+    def _push(self, args, name, left):
+        """Shared logic for LPUSH (left=True) and RPUSH (left=False)."""
+        if len(args) < 2:
+            return _wrong_args(name)
+        key, values = args[0], args[1:]
+        lst = self.storage.get_typed(key, deque)  # WRONGTYPE for non-lists
+        if lst is None:
+            lst = deque()
+            self.storage.set(key, lst)  # new key: no TTL to keep
+        # Modify the deque IN PLACE: storage holds this same object, and
+        # _expires is never touched, so an existing TTL is kept.
+        for v in values:
+            if left:
+                lst.appendleft(v)  # one by one: LPUSH q a b c -> c b a
+            else:
+                lst.append(v)
+        return resp.integer(len(lst))
+
+    def _lpush(self, args):
+        return self._push(args, "lpush", left=True)
+
+    def _rpush(self, args):
+        return self._push(args, "rpush", left=False)
+
+    def _pop(self, args, name, left):
+        """Shared logic for LPOP (left=True) and RPOP (left=False)."""
+        if len(args) != 1:
+            return _wrong_args(name)  # COUNT argument not supported
+        key = args[0]
+        lst = self.storage.get_typed(key, deque)
+        if lst is None:
+            return resp.bulk_string(None)
+        value = lst.popleft() if left else lst.pop()  # both O(1) on a deque
+        self.storage.delete_if_empty(key)  # last item gone -> key + TTL gone
+        return resp.bulk_string(value)
+
+    def _lpop(self, args):
+        return self._pop(args, "lpop", left=True)
+
+    def _rpop(self, args):
+        return self._pop(args, "rpop", left=False)
+
+    def _llen(self, args):
+        if len(args) != 1:
+            return _wrong_args("llen")
+        lst = self.storage.get_typed(args[0], deque)
+        return resp.integer(0 if lst is None else len(lst))
+
+    def _lrange(self, args):
+        if len(args) != 3:
+            return _wrong_args("lrange")
+        key = args[0]
+        start, stop = _parse_int(args[1]), _parse_int(args[2])
+        if start is None or stop is None:
+            return resp.error("ERR value is not an integer or out of range")
+        lst = self.storage.get_typed(key, deque)
+        if lst is None:
+            return resp.array([])
+
+        n = len(lst)
+        # Negative index counts from the end: -1 -> n-1 (last), -2 -> n-2
+        if start < 0:
+            start += n
+        if stop < 0:
+            stop += n
+        start = max(start, 0)  # e.g. -100 on a short list -> 0
+        if start > stop or start >= n:
+            return resp.array([])
+        stop = min(stop, n - 1)  # stop beyond the end -> last element
+        # deque has no slicing; islice walks from the head: O(start + count).
+        # stop is INCLUSIVE in Redis, so +1 for Python's exclusive end.
+        return resp.array(list(islice(lst, start, stop + 1)))
