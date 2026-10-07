@@ -46,6 +46,14 @@ class CommandHandler:
             "PTTL": self._pttl,
             "PERSIST": self._persist,
             "TYPE": self._type,
+            "INCR": self._incr,
+            "DECR": self._decr,
+            "INCRBY": self._incrby,
+            "DECRBY": self._decrby,
+            "APPEND": self._append,
+            "STRLEN": self._strlen,
+            "MSET": self._mset,
+            "MGET": self._mget,
         }
 
     def execute(self, args):
@@ -187,3 +195,83 @@ class CommandHandler:
         if len(args) != 1:
             return _wrong_args("type")
         return resp.simple_string(self.storage.type_of(args[0]))
+
+    # ---------- String commands ----------
+
+    def _incr_by(self, key, delta):
+        """Shared logic for INCR / DECR / INCRBY / DECRBY."""
+        value = self.storage.get_typed(key, str)  # WRONGTYPE for non-strings
+        current = 0 if value is None else _parse_int(value)  # missing key = 0
+        if current is None:
+            return resp.error("ERR value is not an integer or out of range")
+        result = current + delta
+        if not -INT64_MAX - 1 <= result <= INT64_MAX:
+            # Checked BEFORE writing, so the old value stays unchanged
+            return resp.error("ERR increment or decrement would overflow")
+        # Numbers are stored as strings. keep_ttl: INCR must not clear the TTL
+        self.storage.set(key, str(result), keep_ttl=True)
+        return resp.integer(result)
+
+    def _incr(self, args):
+        if len(args) != 1:
+            return _wrong_args("incr")
+        return self._incr_by(args[0], 1)
+
+    def _decr(self, args):
+        if len(args) != 1:
+            return _wrong_args("decr")
+        return self._incr_by(args[0], -1)
+
+    def _incrby(self, args):
+        if len(args) != 2:
+            return _wrong_args("incrby")
+        delta = _parse_int(args[1])
+        if delta is None:
+            return resp.error("ERR value is not an integer or out of range")
+        return self._incr_by(args[0], delta)
+
+    def _decrby(self, args):
+        if len(args) != 2:
+            return _wrong_args("decrby")
+        delta = _parse_int(args[1])
+        if delta is None:
+            return resp.error("ERR value is not an integer or out of range")
+        if delta == -INT64_MAX - 1:
+            # -(INT64_MIN) does not fit in 64 bits; Redis rejects it too
+            return resp.error("ERR decrement would overflow")
+        return self._incr_by(args[0], -delta)
+
+    def _append(self, args):
+        if len(args) != 2:
+            return _wrong_args("append")
+        key, suffix = args
+        value = self.storage.get_typed(key, str)
+        new_value = (value or "") + suffix  # missing key: start from ""
+        self.storage.set(key, new_value, keep_ttl=True)
+        return resp.integer(len(new_value))
+
+    def _strlen(self, args):
+        if len(args) != 1:
+            return _wrong_args("strlen")
+        value = self.storage.get_typed(args[0], str)
+        # Characters, not bytes (real Redis counts bytes: "नमस्ते" = 18)
+        return resp.integer(0 if value is None else len(value))
+
+    def _mset(self, args):
+        if not args or len(args) % 2 != 0:
+            return _wrong_args("mset")
+        # Plain SET for every pair (clears TTL). No await inside, so atomic.
+        for i in range(0, len(args), 2):
+            self.storage.set(args[i], args[i + 1])
+        return resp.simple_string("OK")
+
+    def _mget(self, args):
+        if not args:
+            return _wrong_args("mget")
+        values = []
+        for key in args:
+            try:
+                values.append(self.storage.get_typed(key, str))
+            except WrongTypeError:
+                values.append(None)  # MGET never errors: non-strings are nil
+        return resp.array(values)

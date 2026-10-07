@@ -38,12 +38,16 @@ class Storage:
             return True
         return False
 
-    def set(self, key, value, expire_at_ms=None):
+    def set(self, key, value, expire_at_ms=None, keep_ttl=False):
         """Store value under key (overwrites any old value).
 
         Without expire_at_ms any old TTL is removed, like a plain Redis SET.
+        keep_ttl=True updates only the value and leaves the TTL as it is
+        (for commands that MODIFY a value, like INCR and APPEND).
         """
         self._data[key] = value
+        if keep_ttl:
+            return  # existing expiry (if any) stays untouched
         if expire_at_ms is None:
             self._expires.pop(key, None)
         else:
