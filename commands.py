@@ -62,6 +62,12 @@ class CommandHandler:
             "RPOP": self._rpop,
             "LLEN": self._llen,
             "LRANGE": self._lrange,
+            "HSET": self._hset,
+            "HGET": self._hget,
+            "HDEL": self._hdel,
+            "HGETALL": self._hgetall,
+            "HEXISTS": self._hexists,
+            "HLEN": self._hlen,
         }
 
     def execute(self, args):
@@ -358,3 +364,67 @@ class CommandHandler:
         # deque has no slicing; islice walks from the head: O(start + count).
         # stop is INCLUSIVE in Redis, so +1 for Python's exclusive end.
         return resp.array(list(islice(lst, start, stop + 1)))
+
+    # ---------- Hash commands (value = dict: field -> value) ----------
+
+    def _hset(self, args):
+        # key + at least one field/value pair, and pairs must be complete
+        if len(args) < 3 or len(args) % 2 == 0:
+            return _wrong_args("hset")
+        key = args[0]
+        h = self.storage.get_typed(key, dict)  # WRONGTYPE for non-hashes
+        if h is None:
+            h = {}
+            self.storage.set(key, h)  # new key: no TTL to keep
+        added = 0
+        for i in range(1, len(args), 2):
+            field, value = args[i], args[i + 1]
+            if field not in h:
+                added += 1  # only NEW fields count, updates don't
+            h[field] = value  # in place: existing TTL is kept
+        return resp.integer(added)
+
+    def _hget(self, args):
+        if len(args) != 2:
+            return _wrong_args("hget")
+        h = self.storage.get_typed(args[0], dict)
+        return resp.bulk_string(None if h is None else h.get(args[1]))
+
+    def _hdel(self, args):
+        if len(args) < 2:
+            return _wrong_args("hdel")
+        key = args[0]
+        h = self.storage.get_typed(key, dict)
+        if h is None:
+            return resp.integer(0)
+        removed = 0
+        for field in args[1:]:
+            if field in h:
+                del h[field]
+                removed += 1
+        self.storage.delete_if_empty(key)  # last field gone -> key + TTL gone
+        return resp.integer(removed)
+
+    def _hgetall(self, args):
+        if len(args) != 1:
+            return _wrong_args("hgetall")
+        h = self.storage.get_typed(args[0], dict)
+        if h is None:
+            return resp.array([])
+        # RESP2 has no map type, so flatten: [f1, v1, f2, v2, ...]
+        flat = []
+        for field, value in h.items():
+            flat.extend((field, value))
+        return resp.array(flat)
+
+    def _hexists(self, args):
+        if len(args) != 2:
+            return _wrong_args("hexists")
+        h = self.storage.get_typed(args[0], dict)
+        return resp.integer(int(h is not None and args[1] in h))
+
+    def _hlen(self, args):
+        if len(args) != 1:
+            return _wrong_args("hlen")
+        h = self.storage.get_typed(args[0], dict)
+        return resp.integer(0 if h is None else len(h))
