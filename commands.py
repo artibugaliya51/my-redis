@@ -68,6 +68,12 @@ class CommandHandler:
             "HGETALL": self._hgetall,
             "HEXISTS": self._hexists,
             "HLEN": self._hlen,
+            "SADD": self._sadd,
+            "SREM": self._srem,
+            "SMEMBERS": self._smembers,
+            "SISMEMBER": self._sismember,
+            "SCARD": self._scard,
+            "SINTER": self._sinter,
         }
 
     def execute(self, args):
@@ -428,3 +434,69 @@ class CommandHandler:
             return _wrong_args("hlen")
         h = self.storage.get_typed(args[0], dict)
         return resp.integer(0 if h is None else len(h))
+
+    # ---------- Set commands (value = Python set) ----------
+
+    def _sadd(self, args):
+        if len(args) < 2:
+            return _wrong_args("sadd")
+        key = args[0]
+        s = self.storage.get_typed(key, set)  # WRONGTYPE for non-sets
+        if s is None:
+            s = set()
+            self.storage.set(key, s)  # new key: no TTL to keep
+        added = 0
+        for member in args[1:]:
+            if member not in s:
+                s.add(member)  # in place: existing TTL is kept
+                added += 1  # duplicates don't count
+        return resp.integer(added)
+
+    def _srem(self, args):
+        if len(args) < 2:
+            return _wrong_args("srem")
+        key = args[0]
+        s = self.storage.get_typed(key, set)
+        if s is None:
+            return resp.integer(0)
+        removed = 0
+        for member in args[1:]:
+            if member in s:
+                s.remove(member)
+                removed += 1
+        self.storage.delete_if_empty(key)  # last member gone -> key + TTL gone
+        return resp.integer(removed)
+
+    def _smembers(self, args):
+        if len(args) != 1:
+            return _wrong_args("smembers")
+        s = self.storage.get_typed(args[0], set)
+        # Order is NOT guaranteed (hash order), same as real Redis
+        return resp.array([] if s is None else list(s))
+
+    def _sismember(self, args):
+        if len(args) != 2:
+            return _wrong_args("sismember")
+        s = self.storage.get_typed(args[0], set)
+        return resp.integer(int(s is not None and args[1] in s))  # O(1)
+
+    def _scard(self, args):
+        if len(args) != 1:
+            return _wrong_args("scard")
+        s = self.storage.get_typed(args[0], set)
+        return resp.integer(0 if s is None else len(s))
+
+    def _sinter(self, args):
+        if not args:
+            return _wrong_args("sinter")
+        # 1. Look up ALL keys first: any wrong type -> WRONGTYPE (like Redis)
+        sets = [self.storage.get_typed(key, set) for key in args]
+        # 2. A missing key is an empty set, so the intersection is empty
+        if any(s is None for s in sets):
+            return resp.array([])
+        # 3. Walk the SMALLEST set and keep members found in every other set.
+        #    O(N * M): N = size of smallest set, M = number of sets.
+        #    sorted() returns a new list; the stored sets are never modified.
+        smallest, *others = sorted(sets, key=len)
+        result = [m for m in smallest if all(m in other for other in others)]
+        return resp.array(result)
