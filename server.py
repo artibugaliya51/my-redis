@@ -6,7 +6,7 @@ import traceback
 
 import resp
 from commands import CommandHandler
-from persistence import AOF
+from persistence import AOF, load_aof
 from storage import Storage
 
 HOST = "127.0.0.1"
@@ -88,8 +88,12 @@ async def active_expiry_loop():
 
 
 async def main():
-    # Created here, not at import time, so importing server.py (e.g. in
-    # tests) never creates an AOF file.
+    # 1. Rebuild the data from the AOF BEFORE opening it for appending
+    #    (replay may truncate a torn last command).
+    count = await load_aof(AOF_PATH, handler)
+    print(f"Loaded {count} commands from {AOF_PATH}")
+    # 2. Created here, not at import time, so importing server.py (e.g. in
+    #    tests) never creates an AOF file.
     aof = AOF(AOF_PATH, AOF_FSYNC)
     handler.aof = aof
     try:

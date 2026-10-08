@@ -1,5 +1,6 @@
 """AOF (Append-Only File) persistence: log every write command to disk."""
 
+import asyncio
 import os
 
 import resp
@@ -45,3 +46,58 @@ class AOF:
             return
         self.flush_and_fsync()
         self._file.close()
+
+
+async def load_aof(path, handler):
+    """Replay the AOF at startup: run every logged command again.
+
+    Returns the number of commands replayed. A missing file means a fresh start.
+    An incomplete LAST command (crash during a write) is skipped and cut off.
+    Corruption in the MIDDLE raises RESPError: better to refuse to start
+    than to silently lose data.
+    """
+    if not os.path.exists(path):
+        return 0
+    with open(path, "rb") as f:
+        data = f.read()
+
+    # Reuse our network parser: the file is just a stream of RESP commands
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+
+    # Never log replayed commands again (the file would grow on every restart
+    # and INCRs would be applied twice on the next load)
+    saved_aof, handler.aof = handler.aof, None
+    count = 0
+    offset = 0  # byte position where the last COMPLETE command ends
+    try:
+        while True:
+            try:
+                args = await resp.read_command(reader)
+            except resp.RESPError as e:
+                raise resp.RESPError(f"corrupt AOF {path!r} at byte {offset}: {e}") from None
+            if args is None:
+                break  # end of file (or an incomplete last command)
+
+            # Our AOF is always written with resp.array(), so re-encoding gives
+            # the exact bytes of this command in the file.
+            encoded = resp.array(args)
+            if data[offset:offset + len(encoded)] != encoded:
+                raise resp.RESPError(f"AOF {path!r} has an unexpected format at byte {offset}")
+            offset += len(encoded)
+
+            reply = handler.execute(args)
+            if reply.startswith(b"-"):
+                print(f"[AOF] warning: command {args} failed during replay: {reply.decode().strip()}")
+            count += 1
+    finally:
+        handler.aof = saved_aof
+
+    if offset < len(data):
+        # Torn write: cut it off, otherwise new appends would land after the
+        # garbage and shift every command boundary on the next replay.
+        print(f"[AOF] warning: incomplete last command ({len(data) - offset} bytes) "
+              f"removed; truncating {path!r} to {offset} bytes")
+        os.truncate(path, offset)
+    return count
