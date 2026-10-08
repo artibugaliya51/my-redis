@@ -31,9 +31,15 @@ class AOF:
 
         RESP is exactly what clients send, so replay can reuse read_command().
         """
-        self._file.write(resp.array(args))  # only into Python's buffer so far
+        self._file.write(resp.array(args))  # into Python's buffer
+        # Flush on EVERY command (all policies): Python buffer -> OS page cache.
+        # The page cache belongs to the kernel, so the data now survives a
+        # crash of OUR process (kill -9). Only fsync survives a power cut.
+        self._file.flush()
         if self.fsync_policy == "always":
-            self.flush_and_fsync()
+            os.fsync(self._file.fileno())  # OS page cache -> disk, every command
+        # everysec: the server's aof_fsync_loop() fsyncs once per second
+        # no: never fsync; the OS writes to disk when it wants
 
     def flush_and_fsync(self):
         """Push data all the way to the disk."""

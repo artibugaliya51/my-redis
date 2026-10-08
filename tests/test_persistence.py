@@ -2,7 +2,11 @@
 
 import asyncio
 
+import pytest
+
+import persistence
 import resp
+import server
 from commands import CommandHandler
 from persistence import AOF, load_aof
 from storage import Storage
@@ -128,3 +132,74 @@ def test_failed_command_during_replay_is_skipped(tmp_path, capsys):
     assert count == 3
     assert store.get("ok") == "yes" and store.get("n") == "abc"
     assert "failed during replay" in capsys.readouterr().out
+
+
+# ---------- flush / fsync behaviour per policy ----------
+
+@pytest.fixture
+def fsync_calls(monkeypatch):
+    """Count os.fsync calls instead of really syncing."""
+    calls = []
+    monkeypatch.setattr(persistence.os, "fsync", lambda fd: calls.append(fd))
+    return calls
+
+
+@pytest.mark.parametrize("policy, fsyncs_per_log", [("always", 1), ("everysec", 0), ("no", 0)])
+def test_log_flushes_every_policy_and_fsyncs_only_always(tmp_path, fsync_calls, policy, fsyncs_per_log):
+    path = tmp_path / "appendonly.aof"
+    aof = AOF(path, policy)
+    for i in range(3):
+        aof.log(["SET", "k", str(i)])
+        # Flushed to the OS after EVERY command: another reader already sees it
+        expected = b"".join(resp.array(["SET", "k", str(j)]) for j in range(i + 1))
+        assert path.read_bytes() == expected
+    assert len(fsync_calls) == 3 * fsyncs_per_log
+    aof.close()
+
+
+def test_flush_and_fsync_and_close_always_fsync(tmp_path, fsync_calls):
+    aof = AOF(tmp_path / "appendonly.aof", "no")
+    aof.flush_and_fsync()
+    assert len(fsync_calls) == 1
+    aof.close()
+    assert len(fsync_calls) == 2
+    aof.close()  # second close does nothing
+    assert len(fsync_calls) == 2
+
+
+def test_aof_fsync_loop_calls_flush_and_fsync_periodically(monkeypatch):
+    monkeypatch.setattr(server, "AOF_FSYNC_INTERVAL", 0.01)
+
+    class FakeAOF:
+        calls = 0
+
+        def flush_and_fsync(self):
+            FakeAOF.calls += 1
+
+    async def run_briefly():
+        task = asyncio.create_task(server.aof_fsync_loop(FakeAOF()))
+        await asyncio.sleep(0.1)
+        task.cancel()
+
+    asyncio.run(run_briefly())
+    assert FakeAOF.calls >= 3
+
+
+def test_aof_fsync_loop_survives_an_error(monkeypatch, capsys):
+    monkeypatch.setattr(server, "AOF_FSYNC_INTERVAL", 0.01)
+
+    class BrokenAOF:
+        calls = 0
+
+        def flush_and_fsync(self):
+            BrokenAOF.calls += 1
+            raise OSError("disk full")
+
+    async def run_briefly():
+        task = asyncio.create_task(server.aof_fsync_loop(BrokenAOF()))
+        await asyncio.sleep(0.1)
+        task.cancel()
+
+    asyncio.run(run_briefly())
+    assert BrokenAOF.calls >= 2  # kept running after the first error
+    assert "disk full" in capsys.readouterr().err

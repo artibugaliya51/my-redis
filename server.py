@@ -24,6 +24,8 @@ EXPIRE_INTERVAL = 0.1        # run every 100 ms (Redis "hz 10")
 EXPIRE_TIME_LIMIT_MS = 25    # max time per run, so clients are never blocked long
 EXPIRE_REPEAT_RATIO = 0.25   # repeat immediately if > 25% of the sample was expired
 
+AOF_FSYNC_INTERVAL = 1.0     # everysec: fsync the AOF once per second
+
 
 async def handle_client(reader, writer):
     """Runs once per connected client: read -> execute -> reply, in a loop."""
@@ -87,6 +89,20 @@ async def active_expiry_loop():
             traceback.print_exc()  # a bug here must not silently kill the task
 
 
+async def aof_fsync_loop(aof):
+    """Background task for the everysec policy: fsync the AOF once per second.
+
+    log() already flushed every command to the OS, so this only has to push
+    the OS page cache to the disk. A power cut loses at most ~1 second.
+    """
+    while True:
+        await asyncio.sleep(AOF_FSYNC_INTERVAL)
+        try:
+            aof.flush_and_fsync()
+        except Exception:
+            traceback.print_exc()  # a disk error must not silently kill the task
+
+
 async def main():
     # 1. Rebuild the data from the AOF BEFORE opening it for appending
     #    (replay may truncate a torn last command).
@@ -101,6 +117,8 @@ async def main():
         # Keep a reference: asyncio holds tasks only weakly, so an unreferenced
         # task could be garbage-collected while still running.
         expiry_task = asyncio.create_task(active_expiry_loop())
+        if AOF_FSYNC == "everysec":
+            fsync_task = asyncio.create_task(aof_fsync_loop(aof))
         print(f"My Redis listening on {HOST}:{PORT} (Ctrl+C to stop)")
         async with server:
             await server.serve_forever()
