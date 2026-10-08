@@ -11,6 +11,13 @@ INT64_MAX = 2**63 - 1
 
 WRONGTYPE_MSG = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
+# Commands that change data. Only these are written to the AOF.
+WRITE_COMMANDS = {
+    "SET", "DEL", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST",
+    "INCR", "DECR", "INCRBY", "DECRBY", "APPEND", "MSET",
+    "LPUSH", "RPUSH", "LPOP", "RPOP", "HSET", "HDEL", "SADD", "SREM",
+}
+
 # Strict integer like Redis: optional '-', no spaces, '+', '_' or leading zeros.
 _INT_RE = re.compile(r"-?(0|[1-9][0-9]*)")
 
@@ -30,8 +37,12 @@ def _parse_int(text):
 
 
 class CommandHandler:
-    def __init__(self, storage):
+    def __init__(self, storage, aof=None):
         self.storage = storage
+        self.aof = aof  # None = no persistence (e.g. in unit tests)
+        # A handler sets this when the AOF must get a DIFFERENT command than
+        # the one the client sent (e.g. EXPIRE -> PEXPIREAT with absolute time).
+        self._aof_args = None
         # Dispatch table: command name -> handler method.
         # O(1) lookup instead of a long if/elif chain.
         self.commands = {
@@ -44,6 +55,7 @@ class CommandHandler:
             "KEYS": self._keys,
             "EXPIRE": self._expire,
             "PEXPIRE": self._pexpire,
+            "PEXPIREAT": self._pexpireat,
             "TTL": self._ttl,
             "PTTL": self._pttl,
             "PERSIST": self._persist,
@@ -85,11 +97,17 @@ class CommandHandler:
         handler = self.commands.get(name)
         if handler is None:
             return resp.error(f"ERR unknown command '{args[0]}'")
+        self._aof_args = None
         try:
-            return handler(args[1:])  # pass only the arguments, not the name
+            reply = handler(args[1:])  # pass only the arguments, not the name
         except WrongTypeError:
             # One central place for every command's type errors
             return resp.error(WRONGTYPE_MSG)
+
+        # Log successful writes AFTER memory was changed (errors start with "-")
+        if self.aof is not None and name in WRITE_COMMANDS and not reply.startswith(b"-"):
+            self.aof.log(self._aof_args or [name] + args[1:])
+        return reply
 
     # ---------- Handlers (args = arguments without the command name) ----------
 
@@ -106,19 +124,19 @@ class CommandHandler:
         return resp.bulk_string(args[0])
 
     def _set(self, args):
-        """SET key value [EX seconds | PX milliseconds]"""
+        """SET key value [EX seconds | PX milliseconds | PXAT unix-time-ms]"""
         if len(args) < 2:
             return _wrong_args("set")
         key, value, options = args[0], args[1], args[2:]
 
-        # 1. Parse options (syntax only): at most one EX/PX, each followed
-        #    by a number. The number itself is checked in step 2.
-        unit = None  # "EX" or "PX"
+        # 1. Parse options (syntax only): at most one of EX/PX/PXAT, each
+        #    followed by a number. The number itself is checked in step 2.
+        unit = None  # "EX", "PX" or "PXAT"
         raw_number = None
         i = 0
         while i < len(options):
             opt = options[i].upper()  # options are case-insensitive
-            if opt in ("EX", "PX") and unit is None and i + 1 < len(options):
+            if opt in ("EX", "PX", "PXAT") and unit is None and i + 1 < len(options):
                 unit, raw_number = opt, options[i + 1]
                 i += 2
             else:
@@ -132,13 +150,19 @@ class CommandHandler:
                 return resp.error("ERR value is not an integer or out of range")
             if number <= 0:
                 return resp.error("ERR invalid expire time in 'set' command")
-            duration_ms = number * 1000 if unit == "EX" else number
-            expire_at_ms = now_ms() + duration_ms
+            if unit == "PXAT":
+                expire_at_ms = number  # already absolute
+            else:
+                duration_ms = number * 1000 if unit == "EX" else number
+                expire_at_ms = now_ms() + duration_ms
             if expire_at_ms > INT64_MAX:  # Redis also rejects overflow
                 return resp.error("ERR invalid expire time in 'set' command")
 
         # 3. Everything is valid: now write. expire_at_ms=None clears any old TTL.
         self.storage.set(key, value, expire_at_ms=expire_at_ms)
+        if expire_at_ms is not None:
+            # Log the SAME absolute time we stored, so replay gives the same TTL
+            self._aof_args = ["SET", key, value, "PXAT", str(expire_at_ms)]
         return resp.simple_string("OK")
 
     def _get(self, args):
@@ -164,8 +188,9 @@ class CommandHandler:
 
     # ---------- Expiry commands ----------
 
-    def _generic_expire(self, args, name, unit_ms):
-        """Shared logic for EXPIRE (unit_ms=1000) and PEXPIRE (unit_ms=1)."""
+    def _generic_expire(self, args, name, unit_ms, absolute=False):
+        """Shared logic for EXPIRE (unit_ms=1000), PEXPIRE (unit_ms=1)
+        and PEXPIREAT (absolute=True: the number is already a unix time in ms)."""
         if len(args) != 2:
             return _wrong_args(name)  # NX/XX/GT/LT options not supported
         key = args[0]
@@ -173,16 +198,20 @@ class CommandHandler:
         if number is None:
             return resp.error("ERR value is not an integer or out of range")
 
-        expire_at_ms = now_ms() + number * unit_ms  # relative -> ABSOLUTE
+        now = now_ms()  # read the clock ONCE
+        expire_at_ms = number if absolute else now + number * unit_ms  # -> ABSOLUTE
         if not -INT64_MAX - 1 <= expire_at_ms <= INT64_MAX:
             return resp.error(f"ERR invalid expire time in '{name}' command")
 
+        # Always log the absolute form, so replay later gives the same expiry
+        self._aof_args = ["PEXPIREAT", key, str(expire_at_ms)]
         if self.storage.exists(key) == 0:
             return resp.integer(0)
-        if number <= 0:
+        if expire_at_ms <= now:
             # Time already passed: delete now instead of keeping a dead key
             # in memory until someone touches it (same as real Redis).
             self.storage.delete(key)
+            self._aof_args = ["DEL", key]
             return resp.integer(1)
         # int(): storage returns True/False, but RESP needs :1 / :0
         return resp.integer(int(self.storage.set_expiry(key, expire_at_ms)))
@@ -192,6 +221,9 @@ class CommandHandler:
 
     def _pexpire(self, args):
         return self._generic_expire(args, "pexpire", 1)
+
+    def _pexpireat(self, args):
+        return self._generic_expire(args, "pexpireat", 1, absolute=True)
 
     def _ttl(self, args):
         if len(args) != 1:

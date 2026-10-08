@@ -6,10 +6,13 @@ import traceback
 
 import resp
 from commands import CommandHandler
+from persistence import AOF
 from storage import Storage
 
 HOST = "127.0.0.1"
 PORT = 6380
+AOF_PATH = "appendonly.aof"
+AOF_FSYNC = "everysec"
 
 # ONE shared storage + handler for all clients. Safe without locks because
 # asyncio runs everything on a single thread (same idea as real Redis).
@@ -85,13 +88,20 @@ async def active_expiry_loop():
 
 
 async def main():
-    server = await asyncio.start_server(handle_client, HOST, PORT)
-    # Keep a reference: asyncio holds tasks only weakly, so an unreferenced
-    # task could be garbage-collected while still running.
-    expiry_task = asyncio.create_task(active_expiry_loop())
-    print(f"My Redis listening on {HOST}:{PORT} (Ctrl+C to stop)")
-    async with server:
-        await server.serve_forever()
+    # Created here, not at import time, so importing server.py (e.g. in
+    # tests) never creates an AOF file.
+    aof = AOF(AOF_PATH, AOF_FSYNC)
+    handler.aof = aof
+    try:
+        server = await asyncio.start_server(handle_client, HOST, PORT)
+        # Keep a reference: asyncio holds tasks only weakly, so an unreferenced
+        # task could be garbage-collected while still running.
+        expiry_task = asyncio.create_task(active_expiry_loop())
+        print(f"My Redis listening on {HOST}:{PORT} (Ctrl+C to stop)")
+        async with server:
+            await server.serve_forever()
+    finally:
+        aof.close()  # flush + fsync whatever is still buffered
 
 
 if __name__ == "__main__":
