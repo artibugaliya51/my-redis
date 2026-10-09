@@ -1,6 +1,7 @@
 """Command execution: turns a parsed command into a RESP reply."""
 
 import re
+import time
 from collections import deque
 from itertools import islice
 
@@ -20,6 +21,7 @@ WRITE_COMMANDS = {
     "SET", "DEL", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST",
     "INCR", "DECR", "INCRBY", "DECRBY", "APPEND", "MSET",
     "LPUSH", "RPUSH", "LPOP", "RPOP", "HSET", "HDEL", "SADD", "SREM",
+    "FLUSHALL",
 }
 
 # Strict integer like Redis: optional '-', no spaces, '+', '_' or leading zeros.
@@ -51,6 +53,10 @@ class CommandHandler:
         # replay and in tests). Needed by per-connection commands like SUBSCRIBE.
         self.client = None
         self.pubsub = PubSub()  # channel subscriptions (not data: never in the AOF)
+        # Stats for INFO
+        self.start_time = time.monotonic()  # monotonic: we measure a DURATION
+        self.clients = set()  # connected Client objects (the server adds/removes them)
+        self.total_commands = 0  # commands received from clients (not AOF replay)
         # Dispatch table: command name -> handler method.
         # O(1) lookup instead of a long if/elif chain.
         self.commands = {
@@ -99,6 +105,9 @@ class CommandHandler:
             "SUBSCRIBE": self._subscribe,
             "UNSUBSCRIBE": self._unsubscribe,
             "PUBLISH": self._publish,
+            "DBSIZE": self._dbsize,
+            "FLUSHALL": self._flushall,
+            "INFO": self._info,
         }
 
     def execute(self, args, client=None):
@@ -121,6 +130,8 @@ class CommandHandler:
                 f"ERR Can't execute '{name.lower()}': only (P|S)SUBSCRIBE / "
                 "(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
             )
+        if client is not None:
+            self.total_commands += 1  # count network commands only, not AOF replay
         self._aof_args = None
         try:
             reply = handler(args[1:])  # pass only the arguments, not the name
@@ -621,3 +632,47 @@ class CommandHandler:
             client.writer.write(payload)
             received += 1
         return resp.integer(received)
+
+    # ---------- Server commands ----------
+
+    def _dbsize(self, args):
+        if args:
+            return _wrong_args("dbsize")
+        return resp.integer(self.storage.dbsize())
+
+    def _flushall(self, args):
+        if args:
+            return resp.error("ERR syntax error")  # ASYNC / SYNC not supported
+        self.storage.flushall()
+        return resp.simple_string("OK")
+
+    def _info(self, args):
+        if args:
+            return _wrong_args("info")  # INFO <section> not supported
+        sections = {
+            "Server": {
+                "uptime_in_seconds": int(time.monotonic() - self.start_time),
+            },
+            "Clients": {
+                "connected_clients": len(self.clients),
+            },
+            "Stats": {
+                "total_commands_processed": self.total_commands,
+                "pubsub_channels": len(self.pubsub.channels),
+            },
+            "Persistence": {
+                "aof_enabled": int(self.aof is not None),
+                "appendfsync": self.aof.fsync_policy if self.aof is not None else "-",
+            },
+            "Keyspace": {
+                "keys": self.storage.dbsize(),
+                "keys_with_expiry": self.storage.keys_with_expiry(),
+            },
+        }
+        # Redis format: "# Section" header, "key:value" lines, \r\n endings,
+        # and a blank line between sections
+        blocks = []
+        for title, fields in sections.items():
+            lines = [f"# {title}"] + [f"{key}:{value}" for key, value in fields.items()]
+            blocks.append("\r\n".join(lines))
+        return resp.bulk_string("\r\n\r\n".join(blocks) + "\r\n")

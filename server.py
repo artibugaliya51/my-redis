@@ -34,6 +34,7 @@ async def handle_client(reader, writer):
     """Runs once per connected client: read -> execute -> reply, in a loop."""
     addr = writer.get_extra_info("peername")
     client = Client(writer, addr)  # per-connection state (used by Pub/Sub)
+    handler.clients.add(client)  # for INFO connected_clients
     logger.info("Client connected: %s", addr)
     try:
         while True:
@@ -71,6 +72,7 @@ async def handle_client(reader, writer):
         logger.info("Client disconnected: %s", addr)
         # Forget its subscriptions, or PubSub would keep a dead client forever
         handler.pubsub.unsubscribe_all(client)
+        handler.clients.discard(client)
         writer.close()
         try:
             await writer.wait_closed()

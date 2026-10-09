@@ -130,6 +130,20 @@ class Storage:
                 result.append(key)
         return result
 
+    def dbsize(self):
+        """Number of keys. Like Redis, expired keys not yet removed still count
+        (counting only live keys would need an O(n) scan)."""
+        return len(self._data)
+
+    def keys_with_expiry(self):
+        """Number of keys that have a TTL."""
+        return len(self._expires)
+
+    def flushall(self):
+        """Delete ALL keys and ALL expiries."""
+        self._data.clear()
+        self._expires.clear()
+
     def snapshot(self):
         """List of (key, value, expire_at_ms or None) for every LIVE key.
 

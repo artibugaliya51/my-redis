@@ -295,3 +295,17 @@ def test_redis_py_ping_in_subscribed_mode(r):
     msg = p.get_message(timeout=1)
     assert msg["type"] == "pong"
     p.close()
+
+
+def test_info_connected_clients_and_redis_py_parsing(server_port, r):
+    r.set("a", "1")
+    other = redis.Redis(port=server_port, protocol=2, decode_responses=True)
+    other.ping()
+    info = r.info()  # redis-py parses our INFO format into a dict
+    assert info["connected_clients"] == 2
+    assert info["keys"] == 1 and info["aof_enabled"] == 0
+    assert info["total_commands_processed"] >= 3
+    other.close()
+    assert wait_until(lambda: r.info()["connected_clients"] == 1)
+    assert r.dbsize() == 1
+    assert r.flushall() is True and r.dbsize() == 0
