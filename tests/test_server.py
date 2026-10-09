@@ -255,3 +255,43 @@ def test_slow_subscriber_does_not_block_publisher(server_port, r):
         # The downside: the undelivered bytes pile up in the server's memory
         (sub_client,) = server.handler.pubsub.channels["news"]
         assert sub_client.writer.transport.get_write_buffer_size() > 1_000_000
+
+
+def test_quit_closes_the_connection(server_port, r):
+    with socket.create_connection(("127.0.0.1", server_port), timeout=2) as s:
+        s.sendall(b"*1\r\n$4\r\nQUIT\r\n")
+        assert recv_exactly(s, 5) == b"+OK\r\n"
+        assert s.recv(1024) == b""  # server closed the connection
+    assert r.ping() is True  # other clients unaffected
+
+
+def test_quit_while_subscribed_cleans_up(server_port):
+    with socket.create_connection(("127.0.0.1", server_port), timeout=2) as s:
+        s.sendall(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n")
+        recv_exactly(s, len(b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"))
+        s.sendall(b"*1\r\n$4\r\nQUIT\r\n")
+        assert recv_exactly(s, 5) == b"+OK\r\n"
+        assert s.recv(1024) == b""
+    assert wait_until(lambda: server.handler.pubsub.channels == {})
+
+
+def test_subscribed_mode_over_socket(server_port):
+    with socket.create_connection(("127.0.0.1", server_port), timeout=2) as s:
+        s.sendall(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n")
+        recv_exactly(s, len(b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"))
+        s.sendall(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+        err = b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"
+        assert recv_exactly(s, len(err)) == err
+        s.sendall(b"*1\r\n$4\r\nPING\r\n")
+        pong = b"*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+        assert recv_exactly(s, len(pong)) == pong
+
+
+def test_redis_py_ping_in_subscribed_mode(r):
+    p = r.pubsub()
+    p.subscribe("news")
+    p.get_message(timeout=1)  # subscribe ack
+    p.ping()
+    msg = p.get_message(timeout=1)
+    assert msg["type"] == "pong"
+    p.close()

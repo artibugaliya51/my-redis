@@ -60,6 +60,8 @@ async def handle_client(reader, writer):
             # (backpressure), so our output buffer can't grow forever.
             writer.write(reply)
             await writer.drain()
+            if client.quit_requested:
+                break  # QUIT: +OK is sent, now close (finally does the cleanup)
 
     except ConnectionError:
         pass  # client vanished (reset / broken pipe): just stop

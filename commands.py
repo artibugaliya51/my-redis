@@ -12,6 +12,9 @@ INT64_MAX = 2**63 - 1
 
 WRONGTYPE_MSG = "WRONGTYPE Operation against a key holding the wrong kind of value"
 
+# The only commands a client may run while subscribed to a channel
+SUBSCRIBED_ALLOWED = {"SUBSCRIBE", "UNSUBSCRIBE", "PING", "QUIT"}
+
 # Commands that change data. Only these are written to the AOF.
 WRITE_COMMANDS = {
     "SET", "DEL", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST",
@@ -52,6 +55,7 @@ class CommandHandler:
         # O(1) lookup instead of a long if/elif chain.
         self.commands = {
             "PING": self._ping,
+            "QUIT": self._quit,
             "ECHO": self._echo,
             "SET": self._set,
             "GET": self._get,
@@ -110,6 +114,13 @@ class CommandHandler:
         handler = self.commands.get(name)
         if handler is None:
             return resp.error(f"ERR unknown command '{args[0]}'")
+        # Subscribed mode: pushes and normal replies would be impossible to
+        # tell apart in RESP2, so only a few commands are allowed.
+        if client is not None and client.channels and name not in SUBSCRIBED_ALLOWED:
+            return resp.error(
+                f"ERR Can't execute '{name.lower()}': only (P|S)SUBSCRIBE / "
+                "(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+            )
         self._aof_args = None
         try:
             reply = handler(args[1:])  # pass only the arguments, not the name
@@ -127,9 +138,18 @@ class CommandHandler:
     def _ping(self, args):
         if len(args) > 1:
             return _wrong_args("ping")
+        if self.client is not None and self.client.channels:
+            # Subscribed mode: same array shape as pushes, like real Redis
+            return resp.array(["pong", args[0] if args else ""])
         if args:
             return resp.bulk_string(args[0])
         return resp.simple_string("PONG")
+
+    def _quit(self, args):
+        # The server owns the socket: it closes it after sending this +OK
+        if self.client is not None:
+            self.client.quit_requested = True
+        return resp.simple_string("OK")
 
     def _echo(self, args):
         if len(args) != 1:
