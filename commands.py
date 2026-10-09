@@ -5,6 +5,7 @@ from collections import deque
 from itertools import islice
 
 import resp
+from pubsub import PubSub
 from storage import WrongTypeError, now_ms  # same clock as storage's expiry checks
 
 INT64_MAX = 2**63 - 1
@@ -46,6 +47,7 @@ class CommandHandler:
         # The Client that sent the command being executed (None during AOF
         # replay and in tests). Needed by per-connection commands like SUBSCRIBE.
         self.client = None
+        self.pubsub = PubSub()  # channel subscriptions (not data: never in the AOF)
         # Dispatch table: command name -> handler method.
         # O(1) lookup instead of a long if/elif chain.
         self.commands = {
@@ -90,6 +92,8 @@ class CommandHandler:
             "SCARD": self._scard,
             "SINTER": self._sinter,
             "BGREWRITEAOF": self._bgrewriteaof,
+            "SUBSCRIBE": self._subscribe,
+            "UNSUBSCRIBE": self._unsubscribe,
         }
 
     def execute(self, args, client=None):
@@ -552,3 +556,30 @@ class CommandHandler:
         # but that also means no write can sneak in during the rewrite.
         self.aof.rewrite(self.storage)
         return resp.simple_string("Background append only file rewriting started")
+
+    # ---------- Pub/Sub commands (need the client that sent them) ----------
+
+    def _subscribe(self, args):
+        if not args:
+            return _wrong_args("subscribe")
+        if self.client is None:
+            return resp.error("ERR SUBSCRIBE requires a client connection")
+        # One reply array per channel, all sent together (same as Redis)
+        replies = []
+        for channel in args:
+            count = self.pubsub.subscribe(self.client, channel)
+            replies.append(resp.array(["subscribe", channel, count]))
+        return b"".join(replies)
+
+    def _unsubscribe(self, args):
+        if self.client is None:
+            return resp.error("ERR UNSUBSCRIBE requires a client connection")
+        # No arguments: unsubscribe from ALL channels of this client
+        channels = args if args else sorted(self.client.channels)
+        if not channels:
+            return resp.array(["unsubscribe", None, 0])  # was not subscribed at all
+        replies = []
+        for channel in channels:
+            count = self.pubsub.unsubscribe(self.client, channel)
+            replies.append(resp.array(["unsubscribe", channel, count]))
+        return b"".join(replies)

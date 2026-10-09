@@ -107,7 +107,14 @@ def bulk_string(text):
 
 
 def array(items):
-    """*<count>\\r\\n followed by each item as a bulk string."""
+    """*<count>\\r\\n followed by each item.
+
+    int -> integer (:n), str -> bulk string, None -> nil.
+    """
     out = [b"*" + str(len(items)).encode() + CRLF]
-    out.extend(bulk_string(item) for item in items)
+    for item in items:
+        if isinstance(item, int):
+            out.append(integer(item))  # e.g. the count in a SUBSCRIBE reply
+        else:
+            out.append(bulk_string(item))
     return b"".join(out)

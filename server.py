@@ -65,6 +65,8 @@ async def handle_client(reader, writer):
         pass  # client vanished (reset / broken pipe): just stop
     finally:
         print(f"[-] Client disconnected: {addr}")
+        # Forget its subscriptions, or PubSub would keep a dead client forever
+        handler.pubsub.unsubscribe_all(client)
         writer.close()
         try:
             await writer.wait_closed()

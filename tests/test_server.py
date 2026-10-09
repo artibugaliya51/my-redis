@@ -179,3 +179,30 @@ def test_incr_is_atomic_with_5_threads(server_port):
     check = redis.Redis(port=server_port, protocol=2, decode_responses=True)
     assert check.get("counter") == "5000"
     check.close()
+
+
+# ---------- Pub/Sub over a real connection ----------
+
+def test_subscribe_over_socket_and_cleanup_on_disconnect(server_port):
+    with socket.create_connection(("127.0.0.1", server_port), timeout=2) as s:
+        s.sendall(b"*3\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n$6\r\nsports\r\n")
+        expected = (b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
+                    b"*3\r\n$9\r\nsubscribe\r\n$6\r\nsports\r\n:2\r\n")
+        data = b""
+        while len(data) < len(expected):
+            data += s.recv(1024)
+        assert data == expected
+        assert set(server.handler.pubsub.channels) == {"news", "sports"}
+    # Socket closed: the server must forget this client's subscriptions
+    assert wait_until(lambda: server.handler.pubsub.channels == {})
+
+
+def test_redis_py_pubsub_subscribe(r):
+    p = r.pubsub()
+    p.subscribe("news")
+    msg = p.get_message(timeout=1)
+    assert msg == {"type": "subscribe", "pattern": None, "channel": "news", "data": 1}
+    p.unsubscribe("news")
+    msg = p.get_message(timeout=1)
+    assert msg["type"] == "unsubscribe" and msg["data"] == 0
+    p.close()
