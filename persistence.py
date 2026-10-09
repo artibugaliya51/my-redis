@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from collections import deque
 
 import resp
 
@@ -20,7 +21,7 @@ class AOF:
                 f"invalid fsync_policy {fsync_policy!r}: "
                 f"must be one of {', '.join(FSYNC_POLICIES)}"
             )
-        self.path = path
+        self.path = os.fspath(path)  # accept str or pathlib.Path, store as str
         self.fsync_policy = fsync_policy
         # "ab" = binary APPEND: every write goes to the end of the file,
         # existing content is never overwritten. Creates the file if missing.
@@ -52,6 +53,62 @@ class AOF:
             return
         self.flush_and_fsync()
         self._file.close()
+
+    def rewrite(self, storage):
+        """Compact the AOF: replace the history with the minimal commands that
+        rebuild the CURRENT data. Returns the number of commands written.
+
+        Runs synchronously (no await), so no client write can happen in the
+        middle: the snapshot and the file swap are atomic for all clients.
+        """
+        tmp_path = self.path + ".rewrite.tmp"  # same folder -> os.replace is atomic
+        count = 0
+        try:
+            with open(tmp_path, "wb") as tmp:
+                for cmd in rewrite_commands(storage):
+                    tmp.write(resp.array(cmd))
+                    count += 1
+                tmp.flush()
+                os.fsync(tmp.fileno())  # new file fully on disk BEFORE the swap
+            # Atomic swap: the name now points to the complete new file.
+            # Until this line the old AOF was never touched.
+            os.replace(tmp_path, self.path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)  # old AOF is still intact and still open
+            raise
+
+        # Our open handle still points to the OLD (now unlinked) file:
+        # reopen so new writes are appended to the NEW file.
+        self._file.close()  # log() already flushed every command
+        self._file = open(self.path, "ab")
+        # fsync the folder so the rename itself survives a power cut
+        dir_fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return count
+
+
+def rewrite_commands(storage):
+    """Yield the minimal commands that rebuild storage's current data."""
+    for key, value, expire_at in storage.snapshot():  # expired keys skipped
+        if isinstance(value, str):
+            cmd = ["SET", key, value]
+            if expire_at is not None:
+                cmd += ["PXAT", str(expire_at)]  # TTL in the same command
+            yield cmd
+            continue
+        if isinstance(value, deque):
+            yield ["RPUSH", key, *value]  # RPUSH keeps the original order
+        elif isinstance(value, dict):
+            flat = [item for pair in value.items() for item in pair]  # f1, v1, f2, v2
+            yield ["HSET", key, *flat]
+        elif isinstance(value, set):
+            yield ["SADD", key, *value]
+        if expire_at is not None:
+            yield ["PEXPIREAT", key, str(expire_at)]
 
 
 async def load_aof(path, handler):

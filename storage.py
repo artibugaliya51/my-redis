@@ -130,6 +130,18 @@ class Storage:
                 result.append(key)
         return result
 
+    def snapshot(self):
+        """List of (key, value, expire_at_ms or None) for every LIVE key.
+
+        Expired keys are deleted on the way, not returned. Values are the real
+        objects (not copies), so use the result before anything else changes.
+        """
+        result = []
+        for key in list(self._data):  # copy: expired keys are deleted while looping
+            if not self._expire_if_needed(key):
+                result.append((key, self._data[key], self._expires.get(key)))
+        return result
+
     def set_expiry(self, key, at_ms):
         """Set an absolute expiry (ms). True if the key exists, else False."""
         self._expire_if_needed(key)

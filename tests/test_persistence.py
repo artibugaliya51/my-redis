@@ -203,3 +203,123 @@ def test_aof_fsync_loop_survives_an_error(monkeypatch, capsys):
     asyncio.run(run_briefly())
     assert BrokenAOF.calls >= 2  # kept running after the first error
     assert "disk full" in capsys.readouterr().err
+
+
+# ---------- AOF rewrite (BGREWRITEAOF) ----------
+
+def rewrite_setup(path):
+    """A storage + handler with an AOF attached, like the real server."""
+    store = Storage()
+    aof = AOF(path, "always")
+    return store, CommandHandler(store, aof), aof
+
+
+def test_rewrite_shrinks_1000_incr(tmp_path):
+    path = tmp_path / "appendonly.aof"
+    store, handler, aof = rewrite_setup(path)
+    for _ in range(1000):
+        handler.execute(["INCR", "counter"])
+    before = path.stat().st_size
+
+    assert handler.execute(["BGREWRITEAOF"]) == b"+Background append only file rewriting started\r\n"
+    after = path.stat().st_size
+    aof.close()
+
+    assert after < before / 100
+    assert path.read_bytes() == resp.array(["SET", "counter", "1000"])
+    _, _, count = replay(path)
+    assert count == 1
+
+
+def test_rewrite_replays_to_identical_data_and_expiry(tmp_path, clock):
+    path = tmp_path / "appendonly.aof"
+    store, handler, aof = rewrite_setup(path)
+    for cmd in [
+        ["SET", "name", "Arti"], ["APPEND", "name", " Sharma"], ["SET", "otp", "1234", "EX", "100"],
+        ["RPUSH", "q", "a", "b", "c"], ["LPUSH", "q", "z"], ["LPOP", "q"], ["EXPIRE", "q", "50"],
+        ["HSET", "user:1", "name", "Arti", "city", "Pune", "age", "21"], ["HDEL", "user:1", "age"],
+        ["PEXPIRE", "user:1", "7000"],
+        ["SADD", "tags", "py", "go", "rust"], ["SREM", "tags", "go"], ["EXPIRE", "tags", "30"],
+        ["SET", "plain", "v"], ["INCRBY", "n", "42"],
+    ]:
+        handler.execute(cmd)
+    handler.execute(["BGREWRITEAOF"])
+    aof.close()
+
+    restored, _, _ = replay(path)
+    assert restored._data == store._data  # all 4 types, same values and order
+    assert restored._expires == store._expires  # same absolute expiry times
+    assert list(restored._data["q"]) == ["a", "b", "c"]
+
+
+def test_rewrite_skips_expired_keys(tmp_path, clock):
+    path = tmp_path / "appendonly.aof"
+    store, handler, aof = rewrite_setup(path)
+    handler.execute(["SET", "otp", "1234", "PX", "100"])
+    handler.execute(["RPUSH", "oldq", "x"])
+    handler.execute(["PEXPIRE", "oldq", "100"])
+    handler.execute(["SET", "keep", "v"])
+    clock.advance(101)  # otp and oldq are now expired, never touched
+
+    handler.execute(["BGREWRITEAOF"])
+    aof.close()
+    content = path.read_bytes()
+    assert b"otp" not in content and b"oldq" not in content
+    assert content == resp.array(["SET", "keep", "v"])
+
+
+def test_writes_after_rewrite_are_appended_to_new_file(tmp_path):
+    path = tmp_path / "appendonly.aof"
+    store, handler, aof = rewrite_setup(path)
+    handler.execute(["SET", "a", "1"])
+    handler.execute(["INCR", "a"])
+    handler.execute(["BGREWRITEAOF"])
+    rewritten = path.read_bytes()
+
+    handler.execute(["INCR", "a"])  # must go into the NEW file
+    handler.execute(["SADD", "s", "x"])
+    aof.close()
+
+    assert path.read_bytes() == rewritten + resp.array(["INCR", "a"]) + resp.array(["SADD", "s", "x"])
+    restored, _, count = replay(path)
+    assert count == 3
+    assert restored.get("a") == "3" and restored._data["s"] == {"x"}
+
+
+def test_rewrite_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "appendonly.aof"
+    _, handler, aof = rewrite_setup(path)
+    handler.execute(["SET", "a", "1"])
+    handler.execute(["BGREWRITEAOF"])
+    aof.close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["appendonly.aof"]
+
+
+def test_failed_rewrite_keeps_old_aof(tmp_path, monkeypatch):
+    path = tmp_path / "appendonly.aof"
+    store, handler, aof = rewrite_setup(path)
+    handler.execute(["SET", "a", "1"])
+    handler.execute(["INCR", "a"])
+    original = path.read_bytes()
+
+    def broken_replace(src, dst):
+        raise OSError("simulated crash during rename")
+
+    monkeypatch.setattr(persistence.os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        aof.rewrite(store)
+    monkeypatch.undo()
+
+    assert path.read_bytes() == original  # old AOF untouched
+    assert not (tmp_path / "appendonly.aof.rewrite.tmp").exists()  # temp cleaned up
+    handler.execute(["INCR", "a"])  # old handle still works
+    aof.close()
+    restored, _, _ = replay(path)
+    assert restored.get("a") == "3"
+
+
+def test_bgrewriteaof_errors(tmp_path):
+    handler = CommandHandler(Storage())  # no AOF
+    assert handler.execute(["BGREWRITEAOF"]) == b"-ERR AOF is not enabled\r\n"
+    assert handler.execute(["BGREWRITEAOF", "x"]) == \
+        b"-ERR wrong number of arguments for 'bgrewriteaof' command\r\n"

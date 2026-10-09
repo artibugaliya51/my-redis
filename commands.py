@@ -86,6 +86,7 @@ class CommandHandler:
             "SISMEMBER": self._sismember,
             "SCARD": self._scard,
             "SINTER": self._sinter,
+            "BGREWRITEAOF": self._bgrewriteaof,
         }
 
     def execute(self, args):
@@ -532,3 +533,15 @@ class CommandHandler:
         smallest, *others = sorted(sets, key=len)
         result = [m for m in smallest if all(m in other for other in others)]
         return resp.array(result)
+
+    # ---------- Persistence commands ----------
+
+    def _bgrewriteaof(self, args):
+        if args:
+            return _wrong_args("bgrewriteaof")
+        if self.aof is None:
+            return resp.error("ERR AOF is not enabled")
+        # NOTE: unlike real Redis this runs synchronously (blocks the server),
+        # but that also means no write can sneak in during the rewrite.
+        self.aof.rewrite(self.storage)
+        return resp.simple_string("Background append only file rewriting started")
