@@ -88,7 +88,7 @@ def test_missing_file_gives_zero_commands(tmp_path):
     assert not path.exists()  # replay must not create the file
 
 
-def test_truncated_last_command(tmp_path, capsys):
+def test_truncated_last_command(tmp_path, caplog):
     path = tmp_path / "appendonly.aof"
     good = resp.array(["SET", "a", "1"]) + resp.array(["INCR", "a"])
     torn = resp.array(["SET", "name", "Arti"])[:-5]  # crash halfway through a write
@@ -99,7 +99,7 @@ def test_truncated_last_command(tmp_path, capsys):
     assert store.get("a") == "2"
     assert store.exists("name") == 0
     assert path.read_bytes() == good  # torn tail cut off
-    assert "incomplete last command" in capsys.readouterr().out
+    assert "incomplete last command" in caplog.text  # logged as a WARNING
 
     # After the restart new commands are appended; the next replay must be clean
     aof = AOF(path, "always")
@@ -124,14 +124,14 @@ def test_replay_does_not_change_file_size(tmp_path):
     assert handler.aof is aof  # logging is switched back on after replay
 
 
-def test_failed_command_during_replay_is_skipped(tmp_path, capsys):
+def test_failed_command_during_replay_is_skipped(tmp_path, caplog):
     path = tmp_path / "appendonly.aof"
     path.write_bytes(resp.array(["SET", "n", "abc"]) + resp.array(["INCR", "n"])
                      + resp.array(["SET", "ok", "yes"]))
     store, _, count = replay(path)
     assert count == 3
     assert store.get("ok") == "yes" and store.get("n") == "abc"
-    assert "failed during replay" in capsys.readouterr().out
+    assert "failed during AOF replay" in caplog.text
 
 
 # ---------- flush / fsync behaviour per policy ----------
@@ -185,7 +185,7 @@ def test_aof_fsync_loop_calls_flush_and_fsync_periodically(monkeypatch):
     assert FakeAOF.calls >= 3
 
 
-def test_aof_fsync_loop_survives_an_error(monkeypatch, capsys):
+def test_aof_fsync_loop_survives_an_error(monkeypatch, caplog):
     monkeypatch.setattr(server, "AOF_FSYNC_INTERVAL", 0.01)
 
     class BrokenAOF:
@@ -202,7 +202,7 @@ def test_aof_fsync_loop_survives_an_error(monkeypatch, capsys):
 
     asyncio.run(run_briefly())
     assert BrokenAOF.calls >= 2  # kept running after the first error
-    assert "disk full" in capsys.readouterr().err
+    assert "AOF fsync failed" in caplog.text and "disk full" in caplog.text  # with traceback
 
 
 # ---------- AOF rewrite (BGREWRITEAOF) ----------

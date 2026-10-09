@@ -1,10 +1,13 @@
 """AOF (Append-Only File) persistence: log every write command to disk."""
 
 import asyncio
+import logging
 import os
 from collections import deque
 
 import resp
+
+logger = logging.getLogger(__name__)
 
 FSYNC_POLICIES = ("always", "everysec", "no")
 
@@ -152,7 +155,7 @@ async def load_aof(path, handler):
 
             reply = handler.execute(args)
             if reply.startswith(b"-"):
-                print(f"[AOF] warning: command {args} failed during replay: {reply.decode().strip()}")
+                logger.warning("Command %s failed during AOF replay: %s", args, reply.decode().strip())
             count += 1
     finally:
         handler.aof = saved_aof
@@ -160,7 +163,7 @@ async def load_aof(path, handler):
     if offset < len(data):
         # Torn write: cut it off, otherwise new appends would land after the
         # garbage and shift every command boundary on the next replay.
-        print(f"[AOF] warning: incomplete last command ({len(data) - offset} bytes) "
-              f"removed; truncating {path!r} to {offset} bytes")
+        logger.warning("AOF has an incomplete last command (%d bytes): truncating %r to %d bytes",
+                       len(data) - offset, path, offset)
         os.truncate(path, offset)
     return count

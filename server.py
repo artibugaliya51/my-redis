@@ -1,19 +1,21 @@
-"""My Redis server: asyncio TCP server speaking RESP2 on 127.0.0.1:6380."""
+"""My Redis server: asyncio TCP server speaking RESP2 (default 127.0.0.1:6380).
+
+Options (port, AOF file, fsync policy, log level...): python server.py --help
+"""
 
 import asyncio
+import logging
 import time
-import traceback
 
 import resp
 from client_state import Client
 from commands import CommandHandler
+from config import parse_args
 from persistence import AOF, load_aof
 from storage import Storage
 
-HOST = "127.0.0.1"
-PORT = 6380
-AOF_PATH = "appendonly.aof"
-AOF_FSYNC = "everysec"
+# Explicit name: when run as "python server.py", __name__ would be "__main__"
+logger = logging.getLogger("server")
 
 # ONE shared storage + handler for all clients. Safe without locks because
 # asyncio runs everything on a single thread (same idea as real Redis).
@@ -32,7 +34,7 @@ async def handle_client(reader, writer):
     """Runs once per connected client: read -> execute -> reply, in a loop."""
     addr = writer.get_extra_info("peername")
     client = Client(writer, addr)  # per-connection state (used by Pub/Sub)
-    print(f"[+] Client connected: {addr}")
+    logger.info("Client connected: %s", addr)
     try:
         while True:
             # 1. Read one command. Bad input = protocol error -> close this client.
@@ -53,7 +55,7 @@ async def handle_client(reader, writer):
             try:
                 reply = handler.execute(args, client)
             except Exception:
-                traceback.print_exc()
+                logger.exception("Error while executing %s", args[0])
                 reply = resp.error("ERR internal error")
 
             # 3. Send the reply. drain() waits if the client reads slowly
@@ -66,7 +68,7 @@ async def handle_client(reader, writer):
     except ConnectionError:
         pass  # client vanished (reset / broken pipe): just stop
     finally:
-        print(f"[-] Client disconnected: {addr}")
+        logger.info("Client disconnected: %s", addr)
         # Forget its subscriptions, or PubSub would keep a dead client forever
         handler.pubsub.unsubscribe_all(client)
         writer.close()
@@ -92,7 +94,7 @@ async def active_expiry_loop():
                 if (time.monotonic() - start) * 1000 >= EXPIRE_TIME_LIMIT_MS:
                     break  # time budget used up: continue next tick
         except Exception:
-            traceback.print_exc()  # a bug here must not silently kill the task
+            logger.exception("Active expiry cycle failed")  # must not kill the task
 
 
 async def aof_fsync_loop(aof):
@@ -106,34 +108,44 @@ async def aof_fsync_loop(aof):
         try:
             aof.flush_and_fsync()
         except Exception:
-            traceback.print_exc()  # a disk error must not silently kill the task
+            logger.exception("AOF fsync failed")  # a disk error must not kill the task
 
 
-async def main():
-    # 1. Rebuild the data from the AOF BEFORE opening it for appending
-    #    (replay may truncate a torn last command).
-    count = await load_aof(AOF_PATH, handler)
-    print(f"Loaded {count} commands from {AOF_PATH}")
-    # 2. Created here, not at import time, so importing server.py (e.g. in
-    #    tests) never creates an AOF file.
-    aof = AOF(AOF_PATH, AOF_FSYNC)
-    handler.aof = aof
+async def main(config):
+    aof = None
+    if config.no_aof:
+        logger.info("AOF disabled (--no-aof): data is kept in memory only")
+    else:
+        # 1. Rebuild the data from the AOF BEFORE opening it for appending
+        #    (replay may truncate a torn last command).
+        count = await load_aof(config.aof_file, handler)
+        logger.info("Loaded %d commands from %s", count, config.aof_file)
+        # 2. Created here, not at import time, so importing server.py (e.g. in
+        #    tests) never creates an AOF file.
+        aof = AOF(config.aof_file, config.appendfsync)
+        handler.aof = aof
     try:
-        server = await asyncio.start_server(handle_client, HOST, PORT)
+        server = await asyncio.start_server(handle_client, config.host, config.port)
         # Keep a reference: asyncio holds tasks only weakly, so an unreferenced
         # task could be garbage-collected while still running.
         expiry_task = asyncio.create_task(active_expiry_loop())
-        if AOF_FSYNC == "everysec":
+        if aof is not None and config.appendfsync == "everysec":
             fsync_task = asyncio.create_task(aof_fsync_loop(aof))
-        print(f"My Redis listening on {HOST}:{PORT} (Ctrl+C to stop)")
+        logger.info("My Redis listening on %s:%d (Ctrl+C to stop)", config.host, config.port)
         async with server:
             await server.serve_forever()
     finally:
-        aof.close()  # flush + fsync whatever is still buffered
+        if aof is not None:
+            aof.close()  # flush + fsync whatever is still buffered
 
 
 if __name__ == "__main__":
+    config = parse_args()
+    logging.basicConfig(
+        level=config.log_level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
     try:
-        asyncio.run(main())
+        asyncio.run(main(config))
     except KeyboardInterrupt:
-        print("\nServer stopped.")
+        logger.info("Server stopped.")
