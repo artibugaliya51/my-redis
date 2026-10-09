@@ -5,6 +5,7 @@ import time
 import traceback
 
 import resp
+from client_state import Client
 from commands import CommandHandler
 from persistence import AOF, load_aof
 from storage import Storage
@@ -30,6 +31,7 @@ AOF_FSYNC_INTERVAL = 1.0     # everysec: fsync the AOF once per second
 async def handle_client(reader, writer):
     """Runs once per connected client: read -> execute -> reply, in a loop."""
     addr = writer.get_extra_info("peername")
+    client = Client(writer, addr)  # per-connection state (used by Pub/Sub)
     print(f"[+] Client connected: {addr}")
     try:
         while True:
@@ -49,7 +51,7 @@ async def handle_client(reader, writer):
 
             # 2. Execute. A bug in a command must not kill the connection.
             try:
-                reply = handler.execute(args)
+                reply = handler.execute(args, client)
             except Exception:
                 traceback.print_exc()
                 reply = resp.error("ERR internal error")

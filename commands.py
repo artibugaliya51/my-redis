@@ -43,6 +43,9 @@ class CommandHandler:
         # A handler sets this when the AOF must get a DIFFERENT command than
         # the one the client sent (e.g. EXPIRE -> PEXPIREAT with absolute time).
         self._aof_args = None
+        # The Client that sent the command being executed (None during AOF
+        # replay and in tests). Needed by per-connection commands like SUBSCRIBE.
+        self.client = None
         # Dispatch table: command name -> handler method.
         # O(1) lookup instead of a long if/elif chain.
         self.commands = {
@@ -89,8 +92,12 @@ class CommandHandler:
             "BGREWRITEAOF": self._bgrewriteaof,
         }
 
-    def execute(self, args):
-        """Run one command, e.g. ["SET", "name", "Arti"]. Returns RESP bytes."""
+    def execute(self, args, client=None):
+        """Run one command, e.g. ["SET", "name", "Arti"]. Returns RESP bytes.
+
+        client: the Client that sent it (optional; None for AOF replay/tests).
+        """
+        self.client = client
         if not args:
             return resp.error("ERR empty command")
 

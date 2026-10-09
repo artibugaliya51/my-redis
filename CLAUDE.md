@@ -8,7 +8,7 @@ Goal: finish the project AND help me (Arti) understand it well enough for placem
 - Server code uses only the Python standard library. (redis and pytest are allowed only for tests.)
 - Keep code simple and readable. Clarity over cleverness. Short comments on important logic.
 - Server runs on 127.0.0.1:6380.
-- Files: server.py, resp.py, commands.py, storage.py, persistence.py, pubsub.py, config.py, client.py, tests/
+- Files: server.py, resp.py, commands.py, storage.py, persistence.py, pubsub.py, client_state.py, config.py, client.py, tests/
 - Work one step at a time. Do not implement anything I have not asked for yet.
 
 ## How to explain (very important)
