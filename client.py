@@ -50,7 +50,15 @@ def main():
                 continue
 
             sock.sendall(resp.array(parts))
-            print(repr(read_reply(f)))
+            reply = read_reply(f)
+            print(repr(reply))
+
+            if parts[0].upper() == "SUBSCRIBE" and reply.startswith(b"*3\r\n$9\r\nsubscribe"):
+                # Listen mode: the server now PUSHES messages to us at any time
+                # (and SUBSCRIBE a b sends one reply per channel).
+                print("Listening for messages... (Ctrl+C to quit)")
+                while True:
+                    print(repr(read_reply(f)))
     except (KeyboardInterrupt, EOFError):
         print()  # Ctrl+C / Ctrl+D: exit cleanly
     except ConnectionError as e:

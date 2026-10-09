@@ -94,6 +94,7 @@ class CommandHandler:
             "BGREWRITEAOF": self._bgrewriteaof,
             "SUBSCRIBE": self._subscribe,
             "UNSUBSCRIBE": self._unsubscribe,
+            "PUBLISH": self._publish,
         }
 
     def execute(self, args, client=None):
@@ -583,3 +584,20 @@ class CommandHandler:
             count = self.pubsub.unsubscribe(self.client, channel)
             replies.append(resp.array(["unsubscribe", channel, count]))
         return b"".join(replies)
+
+    def _publish(self, args):
+        if len(args) != 2:
+            return _wrong_args("publish")
+        channel, message = args
+        # Same bytes for every subscriber: encode once
+        payload = resp.array(["message", channel, message])
+        received = 0
+        for client in self.pubsub.channels.get(channel, ()):
+            if client.writer.is_closing():
+                continue  # disconnecting: cleanup will remove it soon
+            # write() only buffers; the event loop sends it in the background.
+            # No await drain() here: a slow subscriber must not block the
+            # publisher (downside: its buffer can grow without limit).
+            client.writer.write(payload)
+            received += 1
+        return resp.integer(received)

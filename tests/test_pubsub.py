@@ -131,3 +131,76 @@ def test_pubsub_commands_are_never_logged(tmp_path, client):
     handler.execute(["UNSUBSCRIBE"], client)
     aof.close()
     assert path.read_bytes() == resp.array(["SET", "k", "v"])  # only the data write
+
+
+# ---------- PUBLISH ----------
+
+class FakeWriter:
+    """Collects written bytes instead of sending them over a socket."""
+
+    def __init__(self, closing=False):
+        self.data = b""
+        self.closing = closing
+
+    def write(self, data):
+        self.data += data
+
+    def is_closing(self):
+        return self.closing
+
+
+def subscriber(handler, *channels, closing=False, port=0):
+    c = Client(FakeWriter(closing), ("127.0.0.1", port))
+    handler.execute(["SUBSCRIBE", *channels], c)
+    c.writer.data = b""  # forget the SUBSCRIBE replies, keep only pushes
+    return c
+
+
+def test_publish_reaches_every_subscriber(handler):
+    s1 = subscriber(handler, "news", port=1)
+    s2 = subscriber(handler, "news", "tech", port=2)
+    other = subscriber(handler, "sports", port=3)
+    assert handler.execute(["PUBLISH", "news", "hello"]) == b":2\r\n"
+    expected = resp.array(["message", "news", "hello"])
+    assert s1.writer.data == expected and s2.writer.data == expected
+    assert other.writer.data == b""  # different channel
+
+
+def test_publish_without_subscribers_returns_zero(handler):
+    assert handler.execute(["PUBLISH", "empty", "hi"]) == b":0\r\n"
+
+
+def test_publish_skips_closing_writers(handler):
+    alive = subscriber(handler, "news", port=1)
+    dying = subscriber(handler, "news", closing=True, port=2)
+    assert handler.execute(["PUBLISH", "news", "x"]) == b":1\r\n"
+    assert alive.writer.data != b"" and dying.writer.data == b""
+
+
+def test_publish_after_unsubscribe(handler):
+    s = subscriber(handler, "news")
+    handler.execute(["UNSUBSCRIBE", "news"], s)
+    s.writer.data = b""
+    assert handler.execute(["PUBLISH", "news", "x"]) == b":0\r\n"
+    assert s.writer.data == b""
+
+
+def test_publish_non_english_message(handler):
+    s = subscriber(handler, "news")
+    handler.execute(["PUBLISH", "news", "नमस्ते"])
+    assert s.writer.data == b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$18\r\n" + "नमस्ते".encode() + b"\r\n"
+
+
+def test_publish_wrong_number_of_arguments(handler):
+    for cmd in (["PUBLISH"], ["PUBLISH", "news"], ["PUBLISH", "news", "a", "b"]):
+        assert handler.execute(cmd) == b"-ERR wrong number of arguments for 'publish' command\r\n"
+
+
+def test_publish_is_never_logged(tmp_path):
+    path = tmp_path / "appendonly.aof"
+    aof = AOF(path, "always")
+    handler = CommandHandler(Storage(), aof)
+    subscriber(handler, "news")
+    handler.execute(["PUBLISH", "news", "hello"])
+    aof.close()
+    assert path.read_bytes() == b""

@@ -206,3 +206,52 @@ def test_redis_py_pubsub_subscribe(r):
     msg = p.get_message(timeout=1)
     assert msg["type"] == "unsubscribe" and msg["data"] == 0
     p.close()
+
+
+def recv_exactly(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        assert chunk, "connection closed early"
+        data += chunk
+    return data
+
+
+def test_publish_between_two_real_clients(server_port):
+    addr = ("127.0.0.1", server_port)
+    with socket.create_connection(addr, timeout=2) as sub, socket.create_connection(addr, timeout=2) as pub:
+        sub.sendall(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n")
+        ack = b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
+        assert recv_exactly(sub, len(ack)) == ack
+
+        pub.sendall(b"*3\r\n$7\r\nPUBLISH\r\n$4\r\nnews\r\n$5\r\nhello\r\n")
+        assert recv_exactly(pub, 4) == b":1\r\n"  # 1 receiver
+        msg = b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n"
+        assert recv_exactly(sub, len(msg)) == msg  # pushed to the subscriber
+
+
+def test_redis_py_publish_and_listen(r, server_port):
+    p = r.pubsub()
+    p.subscribe("news")
+    assert p.get_message(timeout=1)["type"] == "subscribe"
+    assert r.publish("news", "hello") == 1
+    assert r.publish("nobody-here", "x") == 0
+    msg = p.get_message(timeout=1)
+    assert msg == {"type": "message", "pattern": None, "channel": "news", "data": "hello"}
+    p.close()
+
+
+def test_slow_subscriber_does_not_block_publisher(server_port, r):
+    # This subscriber NEVER reads: its socket buffers fill up quickly
+    with socket.create_connection(("127.0.0.1", server_port), timeout=2) as lazy:
+        lazy.sendall(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n")
+        time.sleep(0.1)
+        big = "x" * 10_000
+        start = time.monotonic()
+        for _ in range(500):  # ~5 MB, far more than the OS socket buffers hold
+            assert r.publish("news", big) == 1
+        elapsed = time.monotonic() - start
+        assert elapsed < 5  # publisher was never blocked by the lazy subscriber
+        # The downside: the undelivered bytes pile up in the server's memory
+        (sub_client,) = server.handler.pubsub.channels["news"]
+        assert sub_client.writer.transport.get_write_buffer_size() > 1_000_000
