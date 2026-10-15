@@ -49,10 +49,10 @@ python server.py --port 6400 --no-aof --log-level debug
 
 ```bash
 python client.py                 # interactive; prints raw RESP replies
-my-redis> SET name "Arti Sharma"
+my-redis> SET name "Hello World"
 b'+OK\r\n'
 my-redis> GET name
-b'$11\r\nArti Sharma\r\n'
+b'$11\r\nHello World\r\n'
 ```
 
 Or use the official client:
