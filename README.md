@@ -30,7 +30,7 @@ expiry, persistence, pub/sub) well enough to explain every design decision.
 Requires Python 3.10+ (developed with Python 3.13).
 
 ```bash
-git clone <this-repo-url> my-redis && cd my-redis
+git clone https://github.com/artibugaliya51/my-redis.git && cd my-redis
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements-dev.txt   # redis + pytest, only for tests / benchmark;
